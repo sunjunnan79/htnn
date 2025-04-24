@@ -26,4 +26,5 @@ use (
 	./site
 	./tools
 	./types
+	examples/dev_your_plugin
 )

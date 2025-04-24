@@ -76,6 +76,7 @@ func (conf *config) Init(cb api.ConfigCallbackHandler) error {
 		ttl += 1 * time.Second
 		conf.maxDelay = time.Second / (time.Duration(rps) * 2)
 	}
+
 	loader := ttlcache.LoaderFunc[string, *rate.Limiter](
 		func(c *ttlcache.Cache[string, *rate.Limiter], key string) *ttlcache.Item[string, *rate.Limiter] {
 			bucket := rate.NewLimiter(limitRate, int(burst))
@@ -83,6 +84,7 @@ func (conf *config) Init(cb api.ConfigCallbackHandler) error {
 			return item
 		},
 	)
+
 	buckets := ttlcache.New(
 		ttlcache.WithTTL[string, *rate.Limiter](ttl),
 		ttlcache.WithLoader[string, *rate.Limiter](loader),
