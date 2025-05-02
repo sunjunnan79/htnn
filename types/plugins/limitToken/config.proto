@@ -27,10 +27,10 @@ message Config {
   string rejected_msg = 3;
   Rule rule = 4;
   RedisConfig redis = 5;
+  TokenStatsConfig token_stats = 6; // 新增配置
 }
 
 message Rule {
-
   oneof limit_by {
     string limit_by_header       = 1;
     string limit_by_param        = 2;
@@ -53,5 +53,13 @@ message RedisConfig {
   uint32 service_port = 2;
   string username = 3;
   string password = 4;
-  uint32 timeout = 5; // 毫秒
+  uint32 timeout = 5;
+}
+
+message TokenStatsConfig {
+  int32 window_size = 1;
+  int32 min_samples = 2;
+  float max_ratio = 3;
+  int32 max_tokens_per_req = 4;
+  float exceed_factor = 5;
 }

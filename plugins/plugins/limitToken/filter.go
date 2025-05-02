@@ -16,12 +16,15 @@ package limitToken
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
+	"time"
+
 	"github.com/go-redis/redis_rate/v10"
+	"github.com/pkoukk/tiktoken-go"
 	"mosn.io/htnn/api/pkg/filtermanager/api"
 	"mosn.io/htnn/types/plugins/limitToken"
-	"regexp"
-	"time"
 )
 
 const (
@@ -37,7 +40,6 @@ func factory(c interface{}, callbacks api.FilterCallbackHandler) api.Filter {
 
 type filter struct {
 	api.PassThroughFilter
-
 	callbacks api.FilterCallbackHandler
 	config    *config
 }
@@ -47,6 +49,7 @@ func (f *filter) DecodeHeaders(headers api.RequestHeaderMap, endStream bool) api
 	keys, err := f.getKey(headers)
 	if err != nil {
 		api.LogErrorf("error getting key: %v", err)
+		return api.Continue
 	}
 
 	if f.tokenRate(keys) {
@@ -56,13 +59,76 @@ func (f *filter) DecodeHeaders(headers api.RequestHeaderMap, endStream bool) api
 	return api.Continue
 }
 
-func (f *filter) EncodeData(data api.BufferInstance, endStream bool) api.ResultAction {
+func (f *filter) DecodeRequest(headers api.RequestHeaderMap, data api.BufferInstance, trailers api.RequestTrailerMap) api.ResultAction {
+
+	promptTokens, err := f.extractPromptTokens(data.Bytes())
+	if err != nil {
+		api.LogErrorf("error extracting prompt tokens: %v", err)
+		return api.Continue
+	}
+
+	if ok := f.config.tokenStat.IsExceeded(promptTokens); !ok {
+		return &api.LocalResponse{Code: 409}
+	}
 
 	return api.Continue
 }
 
+func (f *filter) EncodeResponse(headers api.ResponseHeaderMap, data api.BufferInstance, trailers api.ResponseTrailerMap) api.ResultAction {
+
+	var res struct {
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+
+	err := json.Unmarshal(data.Bytes(), &res)
+	if err != nil {
+		api.LogInfof("fail to unmarshal response: %v", err)
+		return api.Continue
+	}
+
+	f.config.tokenStat.Add(res.Usage.PromptTokens, res.Usage.CompletionTokens)
+
+	return api.Continue
+}
+
+func (f *filter) extractPromptTokens(data []byte) (int, error) {
+
+	var req struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+		Model string `json:"model"`
+	}
+
+	if err := json.Unmarshal(data, &req); err != nil {
+		return 0, err
+	}
+
+	var sb strings.Builder
+	for _, m := range req.Messages {
+		sb.WriteString(m.Role)
+		sb.WriteString(": ")
+		sb.WriteString(m.Content)
+		sb.WriteString("\n")
+	}
+
+	text := sb.String()
+
+	enc, err := tiktoken.EncodingForModel(req.Model)
+	if err != nil {
+		return 0, err
+	}
+
+	tokenCount := len(enc.Encode(text, nil, nil))
+	return tokenCount, nil
+}
+
 func (f *filter) tokenRate(keys []string) bool {
-	//对各个key进行限流,任何一个key只要被限流就会失败
+
 	for _, key := range keys {
 		limit := redis_rate.Limit{
 			Rate:   int(f.config.Rule.Rate),
@@ -71,7 +137,7 @@ func (f *filter) tokenRate(keys []string) bool {
 		}
 
 		ctx := context.Background()
-		res, err := f.config.limiter.Allow(ctx, key, limit)
+		res, err := f.config.redisLimiter.Allow(ctx, key, limit)
 		if err != nil {
 			api.LogErrorf("limitReq filter Redis error: %v", err)
 			return false
@@ -106,7 +172,8 @@ func (f *filter) getKey(headers api.RequestHeaderMap) ([]string, error) {
 		raw, ok = headers.Get(ConsumerHeader)
 
 	case *limitToken.Rule_LimitByPerIp:
-		raw, ok, isMatchMode = headers.Host(), true, true
+		raw, ok = headers.Host(), true
+		isMatchMode = true
 
 	case *limitToken.Rule_LimitByPerHeader:
 		raw, ok = headers.Get(v.LimitByPerHeader)
@@ -133,8 +200,15 @@ func (f *filter) getKey(headers api.RequestHeaderMap) ([]string, error) {
 	}
 
 	if isMatchMode {
-		return f.match(raw)
+		result := make([]string, 0, len(f.config.regexps))
+		for _, reg := range f.config.regexps {
+			if matches := reg.FindStringSubmatch(raw); len(matches) > 1 {
+				result = append(result, matches[1])
+			}
+		}
+		return result, nil
 	}
+
 	return []string{raw}, nil
 }
 
@@ -152,18 +226,4 @@ func (f *filter) getCookieValue(headers api.RequestHeaderMap, key string) (strin
 		return cookie.String(), true
 	}
 	return "", false
-}
-
-func (f *filter) match(s string) ([]string, error) {
-	result := make([]string, 0, len(f.config.Rule.Keys))
-	for _, key := range f.config.Rule.Keys {
-		reg, err := regexp.Compile(key)
-		if err != nil {
-			return nil, fmt.Errorf("invalid regexp key %q: %w", key, err)
-		}
-		if matches := reg.FindStringSubmatch(s); len(matches) > 1 {
-			result = append(result, matches[1])
-		}
-	}
-	return result, nil
 }
