@@ -18,7 +18,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/go-redis/redis_rate/v10"
@@ -32,6 +31,7 @@ const (
 )
 
 func factory(c interface{}, callbacks api.FilterCallbackHandler) api.Filter {
+
 	return &filter{
 		callbacks: callbacks,
 		config:    c.(*config),
@@ -44,7 +44,7 @@ type filter struct {
 	config    *config
 }
 
-func (f *filter) DecodeHeaders(headers api.RequestHeaderMap, endStream bool) api.ResultAction {
+func (f *filter) DecodeRequest(headers api.RequestHeaderMap, data api.BufferInstance, trailers api.RequestTrailerMap) api.ResultAction {
 
 	keys, err := f.getKey(headers)
 	if err != nil {
@@ -52,22 +52,20 @@ func (f *filter) DecodeHeaders(headers api.RequestHeaderMap, endStream bool) api
 		return api.Continue
 	}
 
-	if f.tokenRate(keys) {
-		return &api.LocalResponse{Code: 409}
-	}
-
-	return api.Continue
-}
-
-func (f *filter) DecodeRequest(headers api.RequestHeaderMap, data api.BufferInstance, trailers api.RequestTrailerMap) api.ResultAction {
-
-	promptTokens, err := f.extractPromptTokens(data.Bytes())
+	// TODO 添加前置类型转化
+	promptTokenLength, err := f.extractPromptTokens(data.Bytes())
 	if err != nil {
 		api.LogErrorf("error extracting prompt tokens: %v", err)
 		return api.Continue
 	}
 
-	if ok := f.config.tokenStat.IsExceeded(promptTokens); !ok {
+	// 是否超出单位时间限制
+	if ok := f.tokenRate(keys, promptTokenLength); !ok {
+		return &api.LocalResponse{Code: 409}
+	}
+
+	//是否超出预测限制
+	if ok := f.config.tokenStat.IsExceeded(promptTokenLength); !ok {
 		return &api.LocalResponse{Code: 409}
 	}
 
@@ -76,6 +74,7 @@ func (f *filter) DecodeRequest(headers api.RequestHeaderMap, data api.BufferInst
 
 func (f *filter) EncodeResponse(headers api.ResponseHeaderMap, data api.BufferInstance, trailers api.ResponseTrailerMap) api.ResultAction {
 
+	// TODO 增加前置类型转化
 	var res struct {
 		Usage struct {
 			PromptTokens     int `json:"prompt_tokens"`
@@ -89,45 +88,69 @@ func (f *filter) EncodeResponse(headers api.ResponseHeaderMap, data api.BufferIn
 		return api.Continue
 	}
 
+	// 用于限流预测
 	f.config.tokenStat.Add(res.Usage.PromptTokens, res.Usage.CompletionTokens)
 
 	return api.Continue
 }
 
+// TODO 传入类型转化成openai接口范式并添加token计算函数
 func (f *filter) extractPromptTokens(data []byte) (int, error) {
 
 	var req struct {
 		Messages []struct {
 			Role    string `json:"role"`
 			Content string `json:"content"`
+			Name    string `json:"name,omitempty"`
 		} `json:"messages"`
 		Model string `json:"model"`
 	}
 
 	if err := json.Unmarshal(data, &req); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("unmarshal request failed: %w", err)
 	}
 
-	var sb strings.Builder
-	for _, m := range req.Messages {
-		sb.WriteString(m.Role)
-		sb.WriteString(": ")
-		sb.WriteString(m.Content)
-		sb.WriteString("\n")
-	}
-
-	text := sb.String()
-
-	enc, err := tiktoken.EncodingForModel(req.Model)
+	// TODO Find a way to support other model
+	tkm, err := tiktoken.EncodingForModel(req.Model)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("get tokenizer failed: %w", err)
 	}
 
-	tokenCount := len(enc.Encode(text, nil, nil))
-	return tokenCount, nil
+	var tokensPerMessage, tokensPerName, finalAddition int
+	switch req.Model {
+	case "gpt-3.5-turbo-0613",
+		"gpt-3.5-turbo-16k-0613",
+		"gpt-4-0314",
+		"gpt-4-32k-0314",
+		"gpt-4-0613",
+		"gpt-4-32k-0613":
+		tokensPerMessage = 3
+		tokensPerName = 1
+		finalAddition = 3
+	case "gpt-3.5-turbo-0301":
+		tokensPerMessage = 4
+		tokensPerName = -1
+		finalAddition = 3
+	default:
+		return 0, fmt.Errorf("fallback model logic failed for model: %s", req.Model)
+	}
+
+	totalTokens := 0
+	for _, msg := range req.Messages {
+		totalTokens += tokensPerMessage
+		totalTokens += len(tkm.Encode(msg.Role, nil, nil))
+		totalTokens += len(tkm.Encode(msg.Content, nil, nil))
+		if msg.Name != "" {
+			totalTokens += len(tkm.Encode(msg.Name, nil, nil))
+			totalTokens += tokensPerName
+		}
+	}
+	totalTokens += finalAddition
+
+	return totalTokens, nil
 }
 
-func (f *filter) tokenRate(keys []string) bool {
+func (f *filter) tokenRate(keys []string, promptTokenLength int) bool {
 
 	for _, key := range keys {
 		limit := redis_rate.Limit{
@@ -137,7 +160,7 @@ func (f *filter) tokenRate(keys []string) bool {
 		}
 
 		ctx := context.Background()
-		res, err := f.config.redisLimiter.Allow(ctx, key, limit)
+		res, err := f.config.redisLimiter.AllowN(ctx, key, limit, promptTokenLength)
 		if err != nil {
 			api.LogErrorf("limitReq filter Redis error: %v", err)
 			return false
