@@ -21,45 +21,111 @@ import "validate/validate.proto";
 
 option go_package = "mosn.io/htnn/types/plugins/limitToken";
 
+// Config 是 limitToken 插件的顶层配置结构
 message Config {
+  // 规则名称，用于唯一标识当前限流规则
   string rule_name = 1 [(validate.rules).string.min_len = 1];
+
+  // 当请求被限流时返回的 HTTP 状态码，例如 409
   int32 rejected_code = 2;
+
+  // 被拒绝时的返回消息
   string rejected_msg = 3;
+
+  // 限流规则定义
   Rule rule = 4;
+
+  // Redis 配置，用于支持全局/分布式限流
   RedisConfig redis = 5;
-  TokenStatsConfig token_stats = 6; // 新增配置
+
+  // token 统计与预测配置，用于动态评估 CompletionToken
+  TokenStatsConfig token_stats = 6;
+
+  // 模型适配器类型，例如 "openai"
+  LLMAdapter llm_adapter = 7;
 }
 
+// Rule 定义了限流逻辑的依据与速率
 message Rule {
+  // 限流依据，仅可设置一个（oneof）
   oneof limit_by {
-    string limit_by_header       = 1;
-    string limit_by_param        = 2;
-    string limit_by_cookie       = 3;
-    string limit_by_consumer     = 4;
-    string limit_by_per_ip       = 5;
-    string limit_by_per_header   = 6;
-    string limit_by_per_param    = 7;
-    string limit_by_per_cookie   = 8;
+    // 按请求头字段限流（全局）
+    string limit_by_header = 1;
+
+    // 按 URL 参数限流（全局）
+    string limit_by_param = 2;
+
+    // 按 Cookie 字段限流（全局）
+    string limit_by_cookie = 3;
+
+    // 按 consumer（例如 API key）限流（全局）
+    string limit_by_consumer = 4;
+
+    // 按 IP 地址进行限流（单独计数）
+    string limit_by_per_ip = 5;
+
+    // 按请求头字段进行限流（每个值独立计数）
+    string limit_by_per_header = 6;
+
+    // 按 URL 参数进行限流（每个值独立计数）
+    string limit_by_per_param = 7;
+
+    // 按 Cookie 字段进行限流（每个值独立计数）
+    string limit_by_per_cookie = 8;
+
+    // 按 consumer 进行限流（每个值独立计数）
     string limit_by_per_consumer = 9;
   }
 
+  // 突发流量的最大令牌数，类似于桶容量
   int32 burst = 10;
+
+  // 令牌生成速率（每秒 tokens 数）
   int32 rate = 11;
+
+  // 需要提取的 key 表达式（支持正则），用于限流粒度细化
   repeated string keys = 12;
 }
 
+// RedisConfig 配置插件连接 Redis 所需的信息
 message RedisConfig {
+  // Redis 服务地址（例如 localhost:6379）
   string service_addr = 1 [(validate.rules).string.min_len = 1];
+
+  // Redis 服务端口（可选）
   uint32 service_port = 2;
+
+  // Redis 用户名（可选）
   string username = 3;
+
+  // Redis 密码（可选）
   string password = 4;
+
+  // Redis 超时时间（单位：秒）
   uint32 timeout = 5;
 }
 
+// TokenStatsConfig 用于统计 Prompt/Completion token 的关系并预测 Completion token
 message TokenStatsConfig {
+  // 滑动窗口大小（统计样本数量的上限），默认值：1000
   int32 window_size = 1;
+
+  // 启动预测前需要的最小样本数，默认值：10
   int32 min_samples = 2;
+
+  // 默认最大 Prompt/Completion token 比例，默认值：4.0
   float max_ratio = 3;
+
+  // 每次请求允许的最大 token 总数，默认值：2000
   int32 max_tokens_per_req = 4;
+
+  // 超出预测值判断限制的放宽因子，例如 1.5 表示允许 150%，默认值：1.5
   float exceed_factor = 5;
+}
+
+
+// LLMAdapter 表示当前适配的 LLM 厂商类型
+message LLMAdapter {
+  // 模型类型，例如 "openai"，可扩展支持 "zhipu"、"baichuan" 等
+  string type = 1;
 }

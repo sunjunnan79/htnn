@@ -16,22 +16,24 @@ package limitToken
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"mosn.io/htnn/plugins/plugins/limitToken/provider"
 	"time"
 
 	"github.com/go-redis/redis_rate/v10"
-	"github.com/pkoukk/tiktoken-go"
 	"mosn.io/htnn/api/pkg/filtermanager/api"
 	"mosn.io/htnn/types/plugins/limitToken"
 )
 
 const (
-	ConsumerHeader string = "x-mse-consumer"
+	ConsumerHeader         string = "x-mse-consumer"
+	PromptToken            string = "prompt-token"
+	PredictCompletionToken string = "predict-used-token"
+	HistoryStreamDelta     string = "history-stream-delta"
+	AllKeys                string = "all-keys"
 )
 
 func factory(c interface{}, callbacks api.FilterCallbackHandler) api.Filter {
-
 	return &filter{
 		callbacks: callbacks,
 		config:    c.(*config),
@@ -45,113 +47,182 @@ type filter struct {
 }
 
 func (f *filter) DecodeRequest(headers api.RequestHeaderMap, data api.BufferInstance, trailers api.RequestTrailerMap) api.ResultAction {
+	reqID := f.getReqID()
 
+	// 请求结构转换
+	req, err := f.config.llmAdapter.ConvertRequestToHTNN(data.Bytes())
+	if err != nil {
+		api.LogErrorf("failed to convert request to HTNN format: %v", err)
+		return nil
+	}
+
+	// 预测Token是否超限
+	if exceeded := f.config.tokenStat.IsExceeded(req.PromptToken); !exceeded {
+		api.LogErrorf("token exceeded for prompt: %d", req.PromptToken)
+		return &api.LocalResponse{Code: 409}
+	}
+
+	// 获取keys
 	keys, err := f.getKey(headers)
 	if err != nil {
 		api.LogErrorf("error getting key: %v", err)
 		return api.Continue
 	}
 
-	// TODO 添加前置类型转化
-	promptTokenLength, err := f.extractPromptTokens(data.Bytes())
-	if err != nil {
-		api.LogErrorf("error extracting prompt tokens: %v", err)
-		return api.Continue
-	}
+	// 预测CompletionToken
+	predictCompletionToken := f.config.tokenStat.PredictCompletionTokens(req.PromptToken)
 
-	// 是否超出单位时间限制
-	if ok := f.tokenRate(keys, promptTokenLength); !ok {
+	// 单位时间内 token 是否合规
+	if ok := f.tokenRate(keys, predictCompletionToken); !ok {
+		api.LogErrorf("token rate exceeded in DecodeRequest, keys: %v, token: %d", keys, predictCompletionToken)
 		return &api.LocalResponse{Code: 409}
 	}
 
-	//是否超出预测限制
-	if ok := f.config.tokenStat.IsExceeded(promptTokenLength); !ok {
-		return &api.LocalResponse{Code: 409}
-	}
+	// 保存上下文信息
+	f.callbacks.PluginState().Set(reqID, PredictCompletionToken, predictCompletionToken)
+	f.callbacks.PluginState().Set(reqID, AllKeys, keys)
+	f.callbacks.PluginState().Set(reqID, PromptToken, req.PromptToken)
 
 	return api.Continue
 }
 
 func (f *filter) EncodeResponse(headers api.ResponseHeaderMap, data api.BufferInstance, trailers api.ResponseTrailerMap) api.ResultAction {
+	reqID := f.getReqID()
 
-	// TODO 增加前置类型转化
-	var res struct {
-		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-		} `json:"usage"`
-	}
-
-	err := json.Unmarshal(data.Bytes(), &res)
+	// 解析响应
+	resp, err := f.config.llmAdapter.ConvertResponseFromHTNN(data.Bytes())
 	if err != nil {
-		api.LogInfof("fail to unmarshal response: %v", err)
-		return api.Continue
+		api.LogErrorf("failed to convert response from HTNN: %v", err)
+		return nil
 	}
 
-	// 用于限流预测
-	f.config.tokenStat.Add(res.Usage.PromptTokens, res.Usage.CompletionTokens)
+	// 获取 AllKeys
+	value := f.callbacks.PluginState().Get(reqID, AllKeys)
+	if value == nil {
+		api.LogErrorf("missing AllKeys in PluginState, reqID: %s", reqID)
+		return nil
+	}
+	keys, ok := value.([]string)
+	if !ok {
+		api.LogErrorf("invalid type for AllKeys, expected []string, got: %T", value)
+		return nil
+	}
+
+	// 获取预测值
+	value = f.callbacks.PluginState().Get(reqID, PredictCompletionToken)
+	if value == nil {
+		api.LogErrorf("missing PredictCompletionToken in PluginState, reqID: %s", reqID)
+		return nil
+	}
+	predictCompletionToken, ok := value.(int)
+	if !ok {
+		api.LogErrorf("invalid type for PredictCompletionToken, expected int, got: %T", value)
+		return nil
+	}
+
+	// 计算实际差值并判断单位时间速率
+	tokenGap := resp.CompletionTokens - predictCompletionToken
+	if ok := f.tokenRate(keys, tokenGap); !ok {
+		api.LogErrorf("token rate exceeded in EncodeResponse, tokenGap: %d", tokenGap)
+		return &api.LocalResponse{Code: 409}
+	}
+
+	// 清理缓存
+	f.callbacks.PluginState().Set(reqID, AllKeys, nil)
+	f.callbacks.PluginState().Set(reqID, PredictCompletionToken, nil)
+	f.callbacks.PluginState().Set(reqID, PromptToken, nil)
+
+	// 上报统计
+	f.config.tokenStat.Add(resp.PromptTokens, resp.CompletionTokens)
 
 	return api.Continue
 }
 
-// TODO 传入类型转化成openai接口范式并添加token计算函数
-func (f *filter) extractPromptTokens(data []byte) (int, error) {
+func (f *filter) EncodeData(data api.BufferInstance, endStream bool) api.ResultAction {
+	reqID := f.getReqID()
 
-	var req struct {
-		Messages []struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
-			Name    string `json:"name,omitempty"`
-		} `json:"messages"`
-		Model string `json:"model"`
-	}
-
-	if err := json.Unmarshal(data, &req); err != nil {
-		return 0, fmt.Errorf("unmarshal request failed: %w", err)
-	}
-
-	// TODO Find a way to support other model
-	tkm, err := tiktoken.EncodingForModel(req.Model)
-	if err != nil {
-		return 0, fmt.Errorf("get tokenizer failed: %w", err)
-	}
-
-	var tokensPerMessage, tokensPerName, finalAddition int
-	switch req.Model {
-	case "gpt-3.5-turbo-0613",
-		"gpt-3.5-turbo-16k-0613",
-		"gpt-4-0314",
-		"gpt-4-32k-0314",
-		"gpt-4-0613",
-		"gpt-4-32k-0613":
-		tokensPerMessage = 3
-		tokensPerName = 1
-		finalAddition = 3
-	case "gpt-3.5-turbo-0301":
-		tokensPerMessage = 4
-		tokensPerName = -1
-		finalAddition = 3
-	default:
-		return 0, fmt.Errorf("fallback model logic failed for model: %s", req.Model)
-	}
-
-	totalTokens := 0
-	for _, msg := range req.Messages {
-		totalTokens += tokensPerMessage
-		totalTokens += len(tkm.Encode(msg.Role, nil, nil))
-		totalTokens += len(tkm.Encode(msg.Content, nil, nil))
-		if msg.Name != "" {
-			totalTokens += len(tkm.Encode(msg.Name, nil, nil))
-			totalTokens += tokensPerName
+	// 获取历史 delta
+	value := f.callbacks.PluginState().Get(reqID, HistoryStreamDelta)
+	var delta *provider.HTNNStreamDelta
+	if value != nil {
+		var ok bool
+		delta, ok = value.(*provider.HTNNStreamDelta)
+		if !ok {
+			api.LogErrorf("invalid type for HistoryStreamDelta, expected *HTNNStreamDelta, got: %T", value)
+			return nil
 		}
+	} else {
+		delta = &provider.HTNNStreamDelta{}
 	}
-	totalTokens += finalAddition
 
-	return totalTokens, nil
+	// 更新 delta
+	newDelta, err := f.config.llmAdapter.ConvertStreamChunkFromHTNN(delta, data.Bytes())
+	if err != nil {
+		api.LogErrorf("failed to convert stream chunk: %v", err)
+		return nil
+	}
+	delta = newDelta
+
+	if delta.Finish {
+		// 获取 key 列表
+		value = f.callbacks.PluginState().Get(reqID, AllKeys)
+		if value == nil {
+			api.LogErrorf("missing AllKeys from PluginState, reqID: %s", reqID)
+			return nil
+		}
+		keys, ok := value.([]string)
+		if !ok {
+			api.LogErrorf("invalid type for AllKeys, expected []string, got: %T", value)
+			return nil
+		}
+
+		// 获取预测 token
+		value = f.callbacks.PluginState().Get(reqID, PredictCompletionToken)
+		if value == nil {
+			api.LogErrorf("missing PredictCompletionToken from PluginState, reqID: %s", reqID)
+			return nil
+		}
+		predictCompletionToken, ok := value.(int)
+		if !ok {
+			api.LogErrorf("invalid type for PredictCompletionToken, expected int, got: %T", value)
+			return nil
+		}
+
+		// 检查 token 是否超限
+		tokenGap := delta.CompletionTokens - predictCompletionToken
+		if ok := f.tokenRate(keys, tokenGap); !ok {
+			return &api.LocalResponse{Code: 409}
+		}
+
+		// 清理插件状态
+		f.callbacks.PluginState().Set(reqID, AllKeys, nil)
+		f.callbacks.PluginState().Set(reqID, PredictCompletionToken, nil)
+		f.callbacks.PluginState().Set(reqID, HistoryStreamDelta, nil)
+
+		// 获取 prompt token
+		value = f.callbacks.PluginState().Get(reqID, PromptToken)
+		if value == nil {
+			api.LogErrorf("missing PromptToken from PluginState, reqID: %s", reqID)
+			return nil
+		}
+		promptToken, ok := value.(int)
+		if !ok {
+			api.LogErrorf("invalid type for PromptToken, expected int, got: %T", value)
+			return nil
+		}
+
+		// 上报统计
+		f.config.tokenStat.Add(promptToken, delta.CompletionTokens)
+	} else {
+
+		// 非 Finish，暂存 delta
+		f.callbacks.PluginState().Set(reqID, HistoryStreamDelta, delta)
+	}
+
+	return api.Continue
 }
 
 func (f *filter) tokenRate(keys []string, promptTokenLength int) bool {
-
 	for _, key := range keys {
 		limit := redis_rate.Limit{
 			Rate:   int(f.config.Rule.Rate),
@@ -175,6 +246,20 @@ func (f *filter) tokenRate(keys []string, promptTokenLength int) bool {
 	}
 
 	return true
+}
+
+func (f *filter) getReqID() string {
+	// 生成请求唯一标识
+	streamInfo := f.callbacks.StreamInfo()
+	workerID := streamInfo.WorkerID()
+	remoteAddr := streamInfo.DownstreamRemoteParsedAddress()
+	reqID := fmt.Sprintf("%d-%s-%d-%d",
+		workerID,
+		remoteAddr.IP,
+		remoteAddr.Port,
+		streamInfo.AttemptCount())
+
+	return reqID
 }
 
 func (f *filter) getKey(headers api.RequestHeaderMap) ([]string, error) {
